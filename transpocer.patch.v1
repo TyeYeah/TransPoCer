@@ -1,0 +1,896 @@
+diff --git a/include/afl-fuzz.h b/include/afl-fuzz.h
+index 60cc896b..ce1273b9 100644
+--- a/include/afl-fuzz.h
++++ b/include/afl-fuzz.h
+@@ -348,6 +348,9 @@ enum {
+   /* 06 */ QUAD,    /* Quadratic schedule               */
+   /* 07 */ RARE,    /* Rare edges                       */
+   /* 08 */ SEEK,    /* EXPLORE that ignores timings     */
++  //////////////////////////////////////////////////////////////////////////////
++  /* 09 */ TRANSPOCER,    /* TransPoCer, align traces   */
++  //////////////////////////////////////////////////////////////////////////////
+ 
+   POWER_SCHEDULES_NUM
+ 
+@@ -490,6 +493,9 @@ struct foreign_sync {
+ };
+ 
+ typedef struct afl_state {
++  //////////////////////////////////////////////////////////////////////////////
++  u8 gdb_status; /* 0 = in afl-fuzz, 1 = in gdb */
++  //////////////////////////////////////////////////////////////////////////////
+ 
+   /* Position of this state in the global states list */
+   u32 _id;
+diff --git a/qemu_mode/qemuafl b/qemu_mode/qemuafl
+--- a/qemu_mode/qemuafl
++++ b/qemu_mode/qemuafl
+@@ -1 +1 @@
+-Subproject commit c43dd6e0369cd5d2a2458f3bd7f4f58c8de53300
++Subproject commit c43dd6e0369cd5d2a2458f3bd7f4f58c8de53300-dirty
+diff --git a/src/afl-fuzz-bitmap.c b/src/afl-fuzz-bitmap.c
+index e3c114f5..e80f995a 100644
+--- a/src/afl-fuzz-bitmap.c
++++ b/src/afl-fuzz-bitmap.c
+@@ -808,6 +808,19 @@ u8 __attribute__((hot)) save_if_interesting(afl_state_t *afl, void *mem,
+ 
+     keeping = 1;
+ 
++    
++    // //////////////////////////////////////////////////////////////////////////////
++    // char* message = "New test case found";
++    // FILE *logfile = fopen("/root/vuln/tmp/afl.log", "a");
++    // if (logfile == NULL) {
++    //     printf("unable to open the customized log file\n");
++    //     return;
++    // }
++    // fprintf(logfile, "%s\n", message);
++    // fclose(logfile);
++    // //////////////////////////////////////////////////////////////////////////////
++
++
+   }
+ 
+ may_save_fault:
+diff --git a/src/afl-fuzz-queue.c b/src/afl-fuzz-queue.c
+index faec406d..867eb34c 100644
+--- a/src/afl-fuzz-queue.c
++++ b/src/afl-fuzz-queue.c
+@@ -26,6 +26,19 @@
+ #include <limits.h>
+ #include <ctype.h>
+ #include <math.h>
++//////////////////////////////////////////////////////////////////////////////
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <math.h>
++#include <float.h>
++#include <time.h>
++#include <signal.h>
++#include <sys/wait.h>
++//////////////////////////////////////////////////////////////////////////////
++
++// Global variable to count TRANSPOCER executions
++static u32 transpocer_execution_count = 0;
+ 
+ #ifdef _STANDALONE_MODULE
+ void minimize_bits(afl_state_t *afl, u8 *dst, u8 *src) {
+@@ -649,7 +662,6 @@ static u8 check_if_text(afl_state_t *afl, struct queue_entry *q) {
+ 
+       offset += 4;
+       utf8++;
+-      comp -= 3;
+       continue;
+ 
+     }
+@@ -993,6 +1005,699 @@ void cull_queue(afl_state_t *afl) {
+ 
+ }
+ 
++/* Series of functions to calculate trace similarity*/
++
++//////////////////////////////////////////////////////////////////////////////
++#define MAX_SEQ_LEN     500      // Maximum sequence length
++#define MAX_NAME_LEN    100      // Maximum function name length
++#define MAX_SIM_ENTRIES 10000    // Maximum number of similarity entries
++
++const char* log_file = "./transpocer.afl.log";
++
++// Structure to store a similarity triplet
++// Each entry contains two function names and their similarity score
++typedef struct {
++    char name1[MAX_NAME_LEN];
++    char name2[MAX_NAME_LEN];
++    float score;
++} SimEntry;
++
++static SimEntry sim_entries[MAX_SIM_ENTRIES];
++static int sim_count = 0;
++
++/**
++ * Write a message to the specified log file
++ * @param logfile Path to the log file
++ * @param message The log message to write
++ * @return 0 on success, -1 on failure
++ */
++int print2log(const char* logfile, const char* message){
++    FILE *fp = fopen(logfile, "a");
++    if (fp == NULL) {
++        printf("Unable to open the log file in print2log\n");
++        return -1;
++    }
++    
++    // Get the current time
++    time_t now;
++    time(&now);
++    struct tm *local = localtime(&now);
++    
++    // Format the timestamp
++    char timestamp[64];
++    strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", local);
++    
++    // Write the timestamped log message
++    if (fprintf(fp, "[%s] %s\n", timestamp, message) < 0) {
++        printf("Failed to write to log file\n");
++        fclose(fp);
++        return -1;
++    }
++    fclose(fp);
++    return 0;
++}
++
++/**
++ * Extract function name sequences from a trace file and save them to an output file
++ * @param trace_file_path Path to the input trace file
++ * @param output_file_path Path to the output sequence file
++ * @return 0 on success, -1 on failure
++ */
++int extract_trace_sequence(const char* trace_file_path, const char* output_file_path) {
++    FILE* input_fp = fopen(trace_file_path, "r");
++    if (!input_fp) {
++        perror("Error opening trace file");
++        return -1;
++    }
++
++    FILE* output_fp = fopen(output_file_path, "w");
++    if (!output_fp) {
++        perror("Error opening output file");
++        fclose(input_fp);
++        return -1;
++    }
++
++    // Read the trace file in reverse order to arrange functions in call order
++    // First, count the number of lines
++    long line_count = 0;
++    long current_pos = ftell(input_fp);
++    
++    // Temporary buffer to store file content
++    char** lines = NULL;
++    
++    // Count lines and allocate memory
++    char line[300];
++    while (fgets(line, sizeof(line), input_fp)) {
++        line_count++;
++    }
++    
++    // Rewind to the beginning of the file
++    fseek(input_fp, 0, SEEK_SET);
++    
++    // Allocate memory for line content
++    lines = (char**)malloc(line_count * sizeof(char*));
++    if (!lines) {
++        perror("Memory allocation failed");
++        fclose(input_fp);
++        fclose(output_fp);
++        return -1;
++    }
++    
++    // Read all lines
++    long i = 0;
++    while (fgets(line, sizeof(line), input_fp) && i < line_count) {
++        // Remove newline characters
++        line[strcspn(line, "\r\n")] = '\0';
++        if (line[0] == '\0') continue;
++        
++        lines[i] = strdup(line);
++        if (!lines[i]) {
++            perror("Memory allocation failed");
++            // Clean up allocated memory
++            for (long j = 0; j < i; j++) {
++                free(lines[j]);
++            }
++            free(lines);
++            fclose(input_fp);
++            fclose(output_fp);
++            return -1;
++        }
++        i++;
++    }
++    
++    // Process lines in reverse order to extract function names
++    int first = 1; // Used to track if it's the first function name for proper comma separation
++    for (long j = i - 1; j >= 0; j--) {
++        // Example format: "#0  0x0000000000a11e84 in parse_command_modifiers ()"
++        // We need to extract the "parse_command_modifiers" part
++        
++        // Find the left parenthesis, 
++        char* paren_ptr = strchr(lines[j], '(');
++        if (!paren_ptr) continue;
++
++        // the function name is between the second space before the "(" and "(" 
++        char* in_ptr = paren_ptr;
++        int in_found = 0;
++
++        while (in_ptr > lines[j]) {
++            in_ptr--;
++            if (*in_ptr == ' ') {
++                in_found += 1;
++                
++            }
++            if (in_found == 2) {
++                in_ptr++;
++                break;
++            }
++        }
++
++        // Extract the function name
++        int func_name_len = paren_ptr - in_ptr;
++        if (func_name_len <= 0) continue;
++        
++        // Trim trailing spaces from the function name
++        while (func_name_len > 0 && in_ptr[func_name_len - 1] == ' ') {
++            func_name_len--;
++        }
++        
++        char func_name[MAX_NAME_LEN];
++        strncpy(func_name, in_ptr, func_name_len);
++        func_name[func_name_len] = '\0';
++        
++        // Write to the output file, separated by commas
++        if (!first) {
++            if (fprintf(output_fp, ",") < 0) {
++                perror("Failed to write to output file");
++                // Clean up memory
++                for (long k = 0; k <= j; k++) {
++                    free(lines[k]);
++                }
++                free(lines);
++                fclose(input_fp);
++                fclose(output_fp);
++                return -1;
++            }
++        }
++        if (fprintf(output_fp, "%s", func_name) < 0) {
++            perror("Failed to write to output file");
++            // Clean up memory
++            for (long k = 0; k <= j; k++) {
++                free(lines[k]);
++            }
++            free(lines);
++            fclose(input_fp);
++            fclose(output_fp);
++            return -1;
++        }
++        first = 0;
++    }
++    
++    // Clean up memory
++    for (long j = 0; j < i; j++) {
++        free(lines[j]);
++    }
++    free(lines);
++    
++    fclose(input_fp);
++    fclose(output_fp);
++    return 0;
++}
++
++// Load similarity triplets from a file
++// Each line in the file should have the format: name1, name2, score
++static int load_similarity_map(const char* filename) {
++    FILE* fp = fopen(filename, "r");
++    if (!fp) {
++        perror("Error opening similarity file");
++        return -1;
++    }
++
++    char line[300];
++    sim_count = 0;
++
++    while (fgets(line, sizeof(line), fp)) {
++        line[strcspn(line, "\r\n")] = '\0';
++        if (line[0] == '\0' || line[0] == '#') continue;
++
++        char name1[MAX_NAME_LEN], name2[MAX_NAME_LEN];
++        float score;
++        if (sscanf(line, " %[^,], %[^,], %f", name1, name2, &score) != 3) {
++            fprintf(stderr, "Warning: invalid line skipped: %s\n", line);
++            continue;
++        }
++
++        if (sim_count >= MAX_SIM_ENTRIES) {
++            fprintf(stderr, "Error: too many similarity entries\n");
++            fclose(fp);
++            return -1;
++        }
++
++        strncpy(sim_entries[sim_count].name1, name1, MAX_NAME_LEN - 1);
++        strncpy(sim_entries[sim_count].name2, name2, MAX_NAME_LEN - 1);
++        sim_entries[sim_count].score = score;
++        sim_count++;
++    }
++
++    fclose(fp);
++    char formatted_message[100];
++    snprintf(formatted_message, sizeof(formatted_message), "Loaded %d similarity entries from %s", sim_count, filename);
++    print2log(log_file, formatted_message);
++    return 0;
++}
++
++// Find the similarity score between two function names
++static float get_similarity(const char* funcA, const char* funca) {
++    for (int i = 0; i < sim_count; i++) {
++        if (strcmp(sim_entries[i].name1, funcA) == 0 &&
++            strcmp(sim_entries[i].name2, funca) == 0) {
++            return sim_entries[i].score;
++        }
++    }
++    return 0.0;
++}
++
++// Perform weighted local alignment between two sequences
++// A and a are the input sequences, m and n are their lengths
++// d and e are gap penalties, alpha is the tail weight factor
++// aligned_A and aligned_a store the aligned subsequences
++static float weighted_local_alignment(
++    char* A[], int m,
++    char* a[], int n,
++    float d,
++    float e,
++    float alpha,
++    char* aligned_A[], // store aligned from A
++    char* aligned_a[]  // store aligned from a
++    ) {
++    float H[MAX_SEQ_LEN + 1][MAX_SEQ_LEN + 1] = {{0}};
++    float E[MAX_SEQ_LEN + 1][MAX_SEQ_LEN + 1] = {{0}};
++    float F[MAX_SEQ_LEN + 1][MAX_SEQ_LEN + 1] = {{0}};
++
++    float max_score = 0.0;
++    int max_i = 0, max_j = 0;
++
++    // Perform alignment and track the best score
++    for (int i = 1; i <= m; i++) {
++        for (int j = 1; j <= n; j++) {
++            float sim = get_similarity(A[i - 1], a[j - 1]);
++            sim = sim * pow(alpha, m - i);
++
++            E[i][j] = fmax(H[i][j - 1] - d, E[i][j - 1] - e);
++            F[i][j] = fmax(H[i - 1][j] - d, F[i - 1][j] - e);
++            H[i][j] = fmax(0, fmax(H[i - 1][j - 1] + sim, fmax(E[i][j], F[i][j])));
++
++            if (H[i][j] > max_score) {
++                max_score = H[i][j];
++                max_i = i;
++                max_j = j;
++            }
++        }
++    }
++
++    // Extract subsequences based on the best alignment
++    int i = max_i, j = max_j;
++    int aligned_count = 0;
++    while (i > 0 && j > 0 && H[i][j] > 0) {
++        aligned_A[aligned_count] = strdup(A[i - 1]);
++        aligned_a[aligned_count] = strdup(a[j - 1]);
++        aligned_count++;
++        i--;
++        j--;
++    }
++
++    // Reverse the subsequences to maintain the correct order
++    for (int k = 0; k < aligned_count / 2; k++) {
++        char* temp = aligned_A[k];
++        aligned_A[k] = aligned_A[aligned_count - k - 1];
++        aligned_A[aligned_count - k - 1] = temp;
++
++        temp = aligned_a[k];
++        aligned_a[k] = aligned_a[aligned_count - k - 1];
++        aligned_a[aligned_count - k - 1] = temp;
++    }
++
++    float tail_weight = pow(alpha, m - max_i);
++    float weighted_score = max_score * tail_weight;
++
++    float norm_factor = 0.0;
++    for (int j = 0; j < n; j++) {
++        float best = 0.0;
++        for (int i = 0; i < m; i++) {
++            float s = get_similarity(A[i], a[j]);
++            s = s * pow(alpha, m - i - 1);
++            if (s > best) best = s;
++            // printf("m = %d, i = %d, n = %d, j = %d\n", m, i, n, j); /////////////////
++            // printf("Best similarity for (%s, %s): %.2f, and s = %.2f\n", A[i], a[j], get_similarity(A[i], a[j]), s);    ///////////////////////
++        }
++        norm_factor += best;
++    }
++
++    // printf("Weighted local alignment score: %f\n", weighted_score);   ////////////
++    // printf("Normalization factor: %f\n", norm_factor);                ///////////
++    // printf("Normalized weighted local alignment score: %f\n", weighted_score / norm_factor);
++
++    if (norm_factor <= 1e-9) return 0.0;
++    return weighted_score / norm_factor;
++}
++
++// Read a sequence of function names from a file
++// The file should contain comma-separated function names
++static int read_sequence_file(const char* filename, char* seq[], int max_len) {
++    FILE* fp = fopen(filename, "r");
++    if (!fp) {
++        perror("Error opening sequence file");
++        return -1;
++    }
++
++    char line[200];
++    int count = 0;
++    while (fgets(line, sizeof(line), fp) && count < max_len) {
++        line[strcspn(line, "\r\n")] = '\0';
++        if (line[0] == '\0') continue;
++
++        // Split the line by commas and store each element
++        char* token = strtok(line, ",");
++        while (token && count < max_len) {
++            // Trim whitespace from the token
++            while (*token == ' ' || *token == '\t') token++;
++            char* end = token + strlen(token) - 1;
++            while (end > token && (*end == ' ' || *end == '\t')) end--;
++            *(end + 1) = '\0';
++            
++            if (strlen(token) > 0) {
++                seq[count] = strdup(token);
++                if (!seq[count]) {
++                    perror("Memory allocation failed");
++                    fclose(fp);
++                    // Free previously allocated memory
++                    for (int i = 0; i < count; i++) free(seq[i]);
++                    return -1;
++                }
++                count++;
++            }
++            token = strtok(NULL, ",");
++        }
++    }
++    fclose(fp);
++    return count;
++}
++
++// Main function to calculate trace similarity
++// Reads reference and query sequences, loads similarity map, performs alignment, and calculates the score
++float calculate_trace_algorithm(
++    const char* ref_seq_file,
++    const char* query_seq_file,
++    const char* similarity_file) {
++    
++    // 1. Read the query sequence (to be checked against multiple targets)
++    char* a[MAX_SEQ_LEN];
++    int n = read_sequence_file(query_seq_file, a, MAX_SEQ_LEN);
++    if (n <= 0) {
++        perror("Failed to read query sequence");
++        return -1.0;
++    }
++
++    // 2. Load the similarity map
++    if (load_similarity_map(similarity_file) != 0) {
++        for (int i = 0; i < n; i++) free(a[i]);
++        return -1.0;
++    }
++
++    // 3. Open target traces file to read multiple reference sequences
++    FILE* fp = fopen(ref_seq_file, "r");
++    if (!fp) {
++        perror("Error opening target traces file");
++        for (int i = 0; i < n; i++) free(a[i]);
++        return -1.0;
++    }
++
++    float max_score = 0.0;
++    int has_sequences = 0;
++    
++    // 4. Process each line (target sequence) in the target traces file
++    char line[2000];  // Increased buffer size for longer sequences
++    while (fgets(line, sizeof(line), fp)) {
++        line[strcspn(line, "\r\n")] = '\0';
++        if (line[0] == '\0') continue;
++
++        // Create a temporary file to hold this single target sequence
++        char tmp_filename[] = "/tmp/target_seq_XXXXXX";
++        int tmp_fd = mkstemp(tmp_filename);
++        if (tmp_fd == -1) {
++            perror("Failed to create temporary file");
++            fclose(fp);
++            for (int i = 0; i < n; i++) free(a[i]);
++            return -1.0;
++        }
++        
++        FILE* tmp_fp = fdopen(tmp_fd, "w");
++        if (!tmp_fp) {
++            perror("Failed to open temporary file");
++            close(tmp_fd);
++            unlink(tmp_filename);
++            fclose(fp);
++            for (int i = 0; i < n; i++) free(a[i]);
++            return -1.0;
++        }
++        
++        fprintf(tmp_fp, "%s\n", line);
++        fclose(tmp_fp);
++
++        // Read the target sequence
++        char* A[MAX_SEQ_LEN];
++        int m = read_sequence_file(tmp_filename, A, MAX_SEQ_LEN);
++        if (m > 0) {
++            has_sequences = 1;
++            
++            // Perform alignment and store aligned subsequences
++            char* aligned_A[MAX_SEQ_LEN] = {0};
++            char* aligned_a[MAX_SEQ_LEN] = {0};
++            float score = weighted_local_alignment(A, m, a, n, 0.3, 0.1, 0.95, aligned_A, aligned_a);
++
++            // Update max_score if this is the highest score so far
++            if (score > max_score) {
++                max_score = score;
++                
++                // Print the aligned subsequences for the best match
++                for (int i = 0; aligned_A[i] != NULL && aligned_a[i] != NULL; i++) {
++                    char formatted_message[512];
++                    snprintf(formatted_message, sizeof(formatted_message), "Best Match - Reference: %s, Query: %s", aligned_A[i], aligned_a[i]);
++                    print2log(log_file, formatted_message);
++                }
++            }
++
++            // Free aligned sequence memory
++            for (int i = 0; aligned_A[i] != NULL && aligned_a[i] != NULL; i++) {
++                free(aligned_A[i]);
++                free(aligned_a[i]);
++            }
++
++            // Free target sequence memory
++            for (int i = 0; i < m; i++) free(A[i]);
++        }
++
++        // Clean up temporary file
++        unlink(tmp_filename);
++    }
++
++    fclose(fp);
++
++    // 5. Free query sequence memory
++    for (int i = 0; i < n; i++) free(a[i]);
++
++    // Return the maximum similarity score among all target sequences
++    return has_sequences ? max_score : -1.0;
++}
++
++/**
++ * Process a GDB template file and replace placeholders with actual values
++ * @param gdb_template_path Path to the GDB template file
++ * @param gdb_script_path Path to the generated GDB script file
++ * @param test_case_path Path to the test case file
++ * @param trace_log_path Path to the trace log file
++ */
++void prepare_gdb_script(const char* gdb_template_path, const char* gdb_script_path, const char* test_case_path, const char* trace_log_path) {
++    // Open the GDB template file
++    FILE *template_file = fopen(gdb_template_path, "r");
++    if (!template_file) {
++        perror("Error opening GDB template file");
++        return;
++    }
++
++    // Get the size of the template file
++    if (fseek(template_file, 0, SEEK_END) != 0) {
++        perror("Error seeking to end of template file");
++        fclose(template_file);
++        return;
++    }
++    long file_size = ftell(template_file);
++    if (file_size < 0) {
++        perror("Error getting template file size");
++        fclose(template_file);
++        return;
++    }
++    rewind(template_file); // Reset file pointer to the beginning
++
++    // Allocate memory to read the file content
++    char *file_content = (char*)malloc(file_size + 1);
++    if (!file_content) {
++        perror("Memory allocation failed");
++        fclose(template_file);
++        return;
++    }
++
++    // Read the file content
++    if (fread(file_content, 1, file_size, template_file) != (size_t)file_size) {
++        perror("Error reading template file");
++        free(file_content);
++        fclose(template_file);
++        return;
++    }
++    file_content[file_size] = '\0'; // Ensure null-terminated string
++    fclose(template_file);
++
++    // Replace placeholders in the template
++    const char *test_case_placeholder = "test_case_place_holder";
++    const char *trace_log_placeholder = "trace_log_place_holder";
++
++    // Calculate the size of the new content after replacements
++    size_t new_size = file_size;
++    const char *placeholders[] = {test_case_placeholder, trace_log_placeholder};
++    const char *replacements[] = {test_case_path, trace_log_path};
++    size_t placeholder_count = sizeof(placeholders) / sizeof(placeholders[0]);
++
++    for (size_t i = 0; i < placeholder_count; i++) {
++        const char *placeholder = placeholders[i];
++        const char *replacement = replacements[i];
++        size_t placeholder_len = strlen(placeholder);
++        size_t replacement_len = strlen(replacement);
++
++        // Count occurrences of the placeholder in file_content
++        const char *temp = file_content;
++        while ((temp = strstr(temp, placeholder)) != NULL) {
++            new_size += (replacement_len - placeholder_len);
++            temp += placeholder_len;
++        }
++    }
++
++    // Allocate memory for the new content
++    char *new_content = (char *)malloc(new_size + 1);
++    if (!new_content) {
++        perror("Memory allocation failed");
++        free(file_content);
++        return;
++    }
++
++    // Perform the replacement logic
++    const char *src = file_content;
++    char *dest = new_content;
++
++    while (*src) {
++        int replaced = 0;
++        for (size_t i = 0; i < placeholder_count; i++) {
++            const char *placeholder = placeholders[i];
++            const char *replacement = replacements[i];
++            size_t placeholder_len = strlen(placeholder);
++
++            if (strncmp(src, placeholder, placeholder_len) == 0) {
++                strcpy(dest, replacement);
++                dest += strlen(replacement);
++                src += placeholder_len;
++                replaced = 1;
++                break;
++            }
++        }
++        if (!replaced) {
++            *dest++ = *src++;
++        }
++    }
++    *dest = '\0';
++
++    // Write the new content to the GDB script file
++    FILE *script_file = fopen(gdb_script_path, "w");
++    if (!script_file) {
++        perror("Error opening GDB script file");
++        free(file_content);
++        free(new_content);
++        return;
++    }
++
++    if (fprintf(script_file, "%s", new_content) < 0) {
++        perror("Error writing to GDB script file");
++    }
++    fclose(script_file);
++
++    // Free allocated memory
++    free(file_content);
++    free(new_content);
++
++    char log_message[256];
++    snprintf(log_message, sizeof(log_message), "GDB script prepared: %s", gdb_script_path);
++    print2log(log_file, log_message);
++}
++
++float calculate_trace_similarity(afl_state_t *afl, struct queue_entry *q){
++    
++    const char* target_traces = "./transpocer.trace.targets";
++    const char* testcase_trace = "./transpocer.trace.testcase";
++    const char* sim_func_dict = "./transpocer.sim.csv";
++    
++    const char* test_bin = afl->argv[0];
++    print2log(log_file, test_bin);
++    const char* test_case = q->fname;
++
++    const char *gdb_template = "./transpocer.template.gdb";
++    const char *gdb_script = "./transpocer.trace.gdb";
++    const char *gdb_trace = "./transpocer.trace.log";
++    const char *gdb_log = "./transpocer.gdb.log";
++
++    print2log(log_file,"TransPoCer schedule started.");
++    
++    prepare_gdb_script(gdb_template, gdb_script, test_case, gdb_trace);
++    char cmd[256];
++    snprintf(cmd, sizeof(cmd), "gdb -q -x %s >> %s 2>&1", gdb_script, gdb_log);
++    afl->gdb_status = 1;
++    show_stats(afl);
++    
++    pid_t pid = fork();
++    if (pid == 0) {
++        // child process
++        execl("/bin/sh", "sh", "-c", cmd, (char*)NULL);
++        _exit(1);
++    } else if (pid > 0) {
++        // parent process: wait for child process with timeout handling
++        int status;
++        time_t start_time = time(NULL);
++        const int timeout_seconds = 10; // 10 second timeout
++
++        // Use non-blocking waitpid with WNOHANG to avoid indefinite blocking
++        while (1) {
++            pid_t result = waitpid(pid, &status, WNOHANG);
++            
++            if (result == pid) {
++                // Child process has finished
++                break;
++            } else if (result == 0) {
++                // Child process is still running
++                time_t current_time = time(NULL);
++                if (difftime(current_time, start_time) > timeout_seconds) {
++                    // Timeout exceeded, terminate child process
++                    kill(pid, SIGTERM);
++                    sleep(1);
++                    kill(pid, SIGKILL);
++                    break;
++                }
++                
++                // Wait for a short period before checking again
++                usleep(100000); // 100ms
++            } else {
++                // Error occurred in waitpid
++                perror("waitpid failed");
++                break;
++            }
++        }
++    }
++
++    afl->gdb_status = 0;
++
++    extract_trace_sequence(gdb_trace, testcase_trace);
++
++    float result = calculate_trace_algorithm(target_traces, testcase_trace, sim_func_dict);
++
++    if (result < 0) {
++        perror("Similarity calculation failed");
++        return -1;
++    }
++
++    char formatted_message[100];
++    snprintf(formatted_message, sizeof(formatted_message), "Normalized weighted similarity score: %.6f", result);
++    print2log(log_file, formatted_message);
++
++    return result;
++}
++//////////////////////////////////////////////////////////////////////////////
++
++
+ /* Re-selects top_rated[] entries based on the current fuzzing schedule.
+    Each queued entry is executed once to collect trace_bits, and potential
+    candidates for each bitmap index are stored.
+@@ -1431,6 +2136,32 @@ u32 calculate_score(afl_state_t *afl, struct queue_entry *q) {
+ 
+       break;
+ 
++    //////////////////////////////////////////////////////////////////////////////
++    case TRANSPOCER: {
++      transpocer_execution_count++;
++      
++      // Execute the following code only when the counter reaches 1
++      if (transpocer_execution_count == 1) {
++        // Reset the counter
++        transpocer_execution_count = 0;
++        
++        print2log(log_file, "==========================");
++        char afl_log_msg[1024];
++        snprintf(afl_log_msg, sizeof(afl_log_msg), "initial perf score: %u", perf_score);
++        print2log(log_file, afl_log_msg);
++
++        float coefficient = calculate_trace_similarity(afl, q);
++        snprintf(afl_log_msg, sizeof(afl_log_msg), "coefficient: %f", coefficient);
++        print2log(log_file, afl_log_msg); 
++
++        perf_score *= (coefficient > 0.5f) ? coefficient * 5 : 1;
++        snprintf(afl_log_msg, sizeof(afl_log_msg), "adjusted perf score: %u", perf_score);
++        print2log(log_file, afl_log_msg);
++      }
++      break;
++    }
++    //////////////////////////////////////////////////////////////////////////////
++
+     default:
+       PFATAL("Unknown Power Schedule");
+ 
+diff --git a/src/afl-fuzz-state.c b/src/afl-fuzz-state.c
+index f1a94910..37e5f03f 100644
+--- a/src/afl-fuzz-state.c
++++ b/src/afl-fuzz-state.c
+@@ -30,7 +30,8 @@
+ 
+ char *power_names[POWER_SCHEDULES_NUM] = {"explore", "mmopt", "exploit",
+                                           "fast",    "coe",   "lin",
+-                                          "quad",    "rare",  "seek"};
++                                          "quad",    "rare",  "seek", "transpocer"};
++                                          //////////////////////////////////////////////////////////////////////////////
+ 
+ /* Initialize MOpt "globals" for this afl state */
+ 
+diff --git a/src/afl-fuzz-stats.c b/src/afl-fuzz-stats.c
+index 8a04f475..2fd70fb1 100644
+--- a/src/afl-fuzz-stats.c
++++ b/src/afl-fuzz-stats.c
+@@ -1495,6 +1495,19 @@ void show_stats_normal(afl_state_t *afl) {
+               " %s " bSTG bH2 bRB bSTOP cRST RESET_G1,
+        afl->fuzz_mode == 0 ? "explore" : "exploit", get_fuzzing_state(afl));
+ 
++  
++  //////////////////////////////////////////////////////////////////////////////
++  if (afl->power_name == "transpocer") {
++    sprintf(tmp, "%u", afl->gdb_status);
++    if (strcmp(tmp, "0") == 0){
++      SAYF(SET_G1 "\n     " bSTG bLT bH5 bH2 cCYA bSTOP "  [transpocer note] in " cGRA "main" cRST " process, status : " cLRD "%s " cRST bH5 bH2 bH2 bRT "\n", tmp);
++    }
++    else if (strcmp(tmp, "1") == 0){
++      SAYF(SET_G1 "\n     " bSTG bLT bH5 bH2 cCYA bSTOP "  [transpocer note] in " cLRD "gdb" cRST " subprocess, status : " cLRD "%s " cRST bH5 bH2 bRT "\n", tmp);
++    }
++  }
++  //////////////////////////////////////////////////////////////////////////////
++
+ #undef IB
+ 
+   /* Hallelujah! */
+diff --git a/src/afl-fuzz.c b/src/afl-fuzz.c
+index ae203349..fb447f9b 100644
+--- a/src/afl-fuzz.c
++++ b/src/afl-fuzz.c
+@@ -815,7 +815,15 @@ int main(int argc, char **argv_orig, char **envp) {
+ 
+           afl->schedule = SEEK;
+ 
+-        } else {
++        } 
++        //////////////////////////////////////////////////////////////////////////////
++        else if (!stricmp(optarg, "transpocer")) {
++
++          afl->schedule = TRANSPOCER;
++
++        } 
++        //////////////////////////////////////////////////////////////////////////////
++        else {
+ 
+           FATAL("Unknown -p power schedule");
+ 
+@@ -1728,6 +1736,11 @@ int main(int argc, char **argv_orig, char **envp) {
+     case EXPLORE:
+       OKF("Using exploration-based constant power schedule (EXPLORE)");
+       break;
++    //////////////////////////////////////////////////////////////////////////////
++    case TRANSPOCER:
++      OKF("Using TransPoCer, Trace-based Functional Similarity Guided Scheduling, power schedule (TRANSPOCER)");
++      break;
++    //////////////////////////////////////////////////////////////////////////////
+     default:
+       FATAL("Unknown power schedule");
+       break;
+diff --git a/unicorn_mode/unicornafl b/unicorn_mode/unicornafl
+--- a/unicorn_mode/unicornafl
++++ b/unicorn_mode/unicornafl
+@@ -1 +1 @@
+-Subproject commit fb3d2151980966c10571bafbc7a57102282eda9e
++Subproject commit fb3d2151980966c10571bafbc7a57102282eda9e-dirty

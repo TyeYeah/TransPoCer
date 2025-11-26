@@ -1,0 +1,9 @@
+[submodule "SeedGNN"]
+	path = SeedGNN
+	url = https://github.com/Leron33/SeedGNN.git
+[submodule "CLAP"]
+	path = CLAP
+	url = https://github.com/Hustcw/CLAP.git
+[submodule "AFLplusplus"]
+	path = AFLplusplus
+	url = https://github.com/AFLplusplus/AFLplusplus.git
