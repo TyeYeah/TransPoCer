@@ -2,6 +2,13 @@
 transpocer
 
 ## Usage
+
+### Functionally Similar Target Selection
+
+WIP to be published since it is the core of our upcoming work, the python script is based on [CLAP](https://github.com/Hustcw/CLAP) and [SeedGNN](https://github.com/Leron33/SeedGNN).
+
+### Functional Similarity Guided Fuzzing
+
 Patch AFLplusplus first with our modifications
 ```sh
 $ cp transpocer.patch.v1 AFLplusplus/
@@ -97,7 +104,6 @@ q
 Example of `transpocer.sim.csv` (pairs to align the query with the original PoC trace and with the inferred trace): 
 ```sh
 $ cat transpocer.sim.csv
-##############################################################################
 _start,_start,1.0
 __libc_start_main,__libc_start_main,0.99
 ...
@@ -127,7 +133,7 @@ $ cat transpocer.dict
 Run commands (AFL++ with transpocer strategy)
 ```sh
 $ /path/to/afl-fuzz -p transpocer -t 10000 -i /path/to/in -o /path/to/out -x /path/to/workdir/transpocer.dict -- /path/to/target/binary -xx -yy  @@ 
-# or qemu mode
+### or qemu mode
 $ /path/to/afl-fuzz -p transpocer -Q -t 10000 -i /path/to/in -o /path/to/out -x /path/to/workdir/transpocer.dict -- /path/to/target/binary -xx -yy  @@ 
 
 ### main fuzzing
@@ -162,27 +168,27 @@ $ /path/to/afl-fuzz -p transpocer -Q -t 10000 -i /path/to/in -o /path/to/out -x 
 
  AFL ++4.33a {default} (...xxxxxxxxxxxxxx/path/to/target/binary) [transpocer]
 ┌─ process timing ────────────────────────────────────┬─ overall results ────┐
-│        run time : 0 days, 0 hrs, 0 min, 10 sec      │  cycles done : 0     │
-│   last new find : 0 days, 0 hrs, 0 min, 0 sec       │ corpus count : 27    │
+│        run time : 0 days, 0 hrs, 0 min, 34 sec      │  cycles done : 24    │
+│   last new find : 0 days, 0 hrs, 0 min, 9 sec       │ corpus count : 12    │
 │last saved crash : none seen yet                     │saved crashes : 0     │
 │ last saved hang : none seen yet                     │  saved hangs : 0     │
 ├─ cycle progress ─────────────────────┬─ map coverage┴──────────────────────┤
-│  now processing : 0.0 (0.0%)         │    map density : 2.62% / 2.80%      │
-│  runs timed out : 0 (0.00%)          │ count coverage : 1.24 bits/tuple    │
+│  now processing : 10.1 (83.3%)       │    map density : 0.31% / 0.38%      │
+│  runs timed out : 0 (0.00%)          │ count coverage : 1.11 bits/tuple    │
 ├─ stage progress ─────────────────────┼─ findings in depth ─────────────────┤
-│  now trying : bitflip 2/1            │ favored items : 1 (3.70%)           │
-│ stage execs : 7/15 (46.67%)          │  new edges on : 23 (85.19%)         │
-│ total execs : 217                    │ total crashes : 0 (0 saved)         │
-│  exec speed : 20.63/sec (slow!)      │  total tmouts : 0 (0 saved)         │
+│  now trying : havoc                  │ favored items : 10 (83.33%)         │
+│ stage execs : 34/800 (4.25%)         │  new edges on : 11 (91.67%)         │
+│ total execs : 38.5k                  │ total crashes : 0 (0 saved)         │
+│  exec speed : 1162/sec               │  total tmouts : 0 (0 saved)         │
 ├─ fuzzing strategy yields ────────────┴─────────────┬─ item geometry ───────┤
-│   bit flips : 16/16, 0/0, 0/0                      │    levels : 2         │
-│  byte flips : 0/0, 0/0, 0/0                        │   pending : 27        │
-│ arithmetics : 0/0, 0/0, 0/0                        │  pend fav : 1         │
-│  known ints : 0/0, 0/0, 0/0                        │ own finds : 25        │
+│   bit flips : 0/0, 0/0, 0/0                        │    levels : 6         │
+│  byte flips : 0/0, 0/0, 0/0                        │   pending : 5         │
+│ arithmetics : 0/0, 0/0, 0/0                        │  pend fav : 4         │
+│  known ints : 0/0, 0/0, 0/0                        │ own finds : 11        │
 │  dictionary : 0/0, 0/0, 0/0, 0/0                   │  imported : 0         │
-│havoc/splice : 0/0, 0/0                             │ stability : 100.00%   │
+│havoc/splice : 11/38.3k, 0/0                        │ stability : 100.00%   │
 │py/custom/rq : unused, unused, unused, unused       ├───────────────────────┘
-│    trim/eff : n/a, n/a                             │          [cpu000:  5%]
+│    trim/eff : 68.31%/34, n/a                       │          [cpu000:  7%]
 └─ strategy: explore ────────── state: started :-) ──┘
      ┌───────  [transpocer note] in gdb process, status : 1 ──────────┐
 
